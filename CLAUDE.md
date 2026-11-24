@@ -2,7 +2,7 @@
 
 Personal learning / POC project: shows how an **MCP server** lets AI agents work with a helpdesk
 issue board (tickets). Everything runs locally with fake data; there is no real Helpdesk backend here.
-The README (Thai) has the full walkthrough and a presentation script.
+The README has the full walkthrough and a presentation script. The fake LLM replies in English or Thai (it follows the language of the question); sample tickets are in Thai.
 
 ## The pieces
 - `fake_api.py` + `board.html` — pretend Helpdesk backend: in-memory tickets behind a REST API, a live

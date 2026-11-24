@@ -19,6 +19,7 @@ Swapping FakeLLM for a real model changes only FakeLLM.next_step(); the loop sta
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import os
 import re
@@ -77,11 +78,25 @@ def _find_status(t: str) -> str | None:
     return None
 
 
+# Reply in the user's language: Thai if the message has Thai characters, otherwise English.
+_THAI = contextvars.ContextVar("thai", default=True)
+
+
+def _use_language_of(text: str) -> None:
+    _THAI.set(bool(re.search(r"[฀-๿]", text)))
+
+
+def L(th: str, en: str) -> str:
+    return th if _THAI.get() else en
+
+
 def _sla_text(t: dict) -> str:
     if t.get("status") == "resolved":
-        return "ปิดแล้ว"
+        return L("ปิดแล้ว", "resolved")
     h = (datetime.fromisoformat(t["sla_due"]) - datetime.now(timezone.utc)).total_seconds() / 3600
-    return f"SLA เกินมา {-h:.1f} ชม." if h < 0 else f"SLA เหลือ {h:.1f} ชม."
+    if h < 0:
+        return L(f"SLA เกินมา {-h:.1f} ชม.", f"SLA breached {-h:.1f}h ago")
+    return L(f"SLA เหลือ {h:.1f} ชม.", f"SLA {h:.1f}h left")
 
 
 class FakeLLM:
@@ -96,6 +111,7 @@ class FakeLLM:
 
     # ---- the one method a real model would replace ------------------------------------------
     def next_step(self, user_text: str, tools: dict[str, dict], done: list[dict]) -> dict:
+        _use_language_of(user_text)
         plan = self._plan(user_text, tools)
         if isinstance(plan, str):  # nothing to call
             return {"type": "answer", "text": plan}
@@ -124,7 +140,8 @@ class FakeLLM:
                 plan.append(("update_ticket", {"ticket_id": tid, "assignee": assignee.group(1)}))
             if re.search(r"(?<!เ)ปิด|resolve|close", t) and not re.search(r"(?<!เ)ปิดแล้ว", t):  # "เปิด" contains "ปิด"
                 # update_ticket's description says: comment before resolving. A good model follows it.
-                plan.append(("add_comment", {"ticket_id": tid, "text": comment_text or "ดำเนินการเรียบร้อย ปิดงานผ่าน AI helper"}))
+                default_note = L("ดำเนินการเรียบร้อย ปิดงานผ่าน AI helper", "Done. Closed via the AI helper.")
+                plan.append(("add_comment", {"ticket_id": tid, "text": comment_text or default_note}))
                 plan.append(("update_ticket", {"ticket_id": tid, "status": "resolved"}))
                 comment_text = None
             elif re.search(r"เปลี่ยน|ปรับ|ย้าย|set|เป็น|change", t):
@@ -145,16 +162,19 @@ class FakeLLM:
 
         elif re.search(r"stock|สต็อก|สต๊อก|คลังสินค้า|คำสั่งซื้อ|\border\b|ราคาสินค้า", t):
             names = ", ".join(f"`{n}`" for n in tools)
-            return ("ทำไม่ได้ครับ: MCP server ที่เชื่อมอยู่ (helpdesk) ไม่มี tool เรื่องสต็อกหรือคำสั่งซื้อ "
-                    f"มีแค่ {names}\n\nถ้าอยากให้ AI helper เช็กสต็อกได้ ต้องเชื่อม MCP server ของระบบ stock/ERP เพิ่ม "
-                    "โดย agent service ตัวเดิมต่อหลาย MCP server พร้อมกันได้ ไม่ต้องแก้ server.py")
+            return L("ทำไม่ได้ครับ: MCP server ที่เชื่อมอยู่ (helpdesk) ไม่มี tool เรื่องสต็อกหรือคำสั่งซื้อ "
+                     f"มีแค่ {names}\n\nถ้าอยากให้ AI helper เช็กสต็อกได้ ต้องเชื่อม MCP server ของระบบ stock/ERP เพิ่ม "
+                     "โดย agent service ตัวเดิมต่อหลาย MCP server พร้อมกันได้ ไม่ต้องแก้ server.py",
+                     "I can't do that: the connected MCP server (helpdesk) has no stock or order tools, "
+                     f"only {names}\n\nTo let the AI helper check stock, connect the stock/ERP system's MCP server "
+                     "as well. The same agent service can use several MCP servers at once; server.py doesn't change.")
 
         else:
             args = {}
             if re.search(r"sla|หลุด|เกินกำหนด|ใกล้ครบ|ใกล้หมด", t):
                 hours = re.search(r"(\d+(?:\.\d+)?)\s*(?:ชั่วโมง|ชม|hours?|hrs?|h\b)", t)
                 args["sla_due_within_hours"] = float(hours.group(1)) if hours else 4.0
-            if (p := _find_priority(t)) and not re.search(r"สรุป|จำนวน|กี่", t):
+            if (p := _find_priority(t)) and not re.search(r"สรุป|จำนวน|กี่|how many|count|summar", t):
                 args["priority"] = p
             if (s := _find_status(t)) and "sla_due_within_hours" not in args:
                 args["status"] = s
@@ -168,14 +188,18 @@ class FakeLLM:
                 plan.append(("search_tickets", args))
             else:
                 lines = "\n".join(f"• `{n}`: {d.get('description', '').splitlines()[0]}" for n, d in tools.items())
-                return ("ยังไม่เข้าใจคำสั่งครับ (fake LLM ใช้ keyword ง่าย ๆ) ลองถามเรื่อง ticket เช่น "
-                        "\"มี ticket ไหน SLA จะหลุดใน 4 ชั่วโมง\" หรือ \"ดู ticket 1003\"\n\n"
-                        f"Tools ที่ MCP server ให้มา:\n{lines}")
+                return L("ยังไม่เข้าใจคำสั่งครับ (fake LLM ใช้ keyword ง่าย ๆ) ลองถามเรื่อง ticket เช่น "
+                         "\"มี ticket ไหน SLA จะหลุดใน 4 ชั่วโมง\" หรือ \"ดู ticket 1003\"\n\n"
+                         f"Tools ที่ MCP server ให้มา:\n{lines}",
+                         "I didn't understand that (the fake LLM only knows simple keywords). Try a ticket question "
+                         "such as \"Which tickets will breach SLA within 4 hours?\" or \"Show me ticket 1003\".\n\n"
+                         f"Tools offered by the MCP server:\n{lines}")
 
         missing = [name for name, _ in plan if name not in tools]
         if missing:
-            return (f"ทำไม่ได้ครับ: ต้องใช้ tool `{missing[0]}` แต่ MCP server ไม่มี tool นี้ "
-                    f"(ตอนนี้มี: {', '.join(tools)})")
+            return L(f"ทำไม่ได้ครับ: ต้องใช้ tool `{missing[0]}` แต่ MCP server ไม่มี tool นี้ (ตอนนี้มี: {', '.join(tools)})",
+                     f"I can't do that: it needs the `{missing[0]}` tool, which the MCP server doesn't offer "
+                     f"(available: {', '.join(tools)})")
         return plan
 
     @staticmethod
@@ -185,8 +209,12 @@ class FakeLLM:
             title = m.group(1)
         elif m := re.search(r"(?:ticket|ทิกเก็ต|เคส)\s*(?:ใหม่)?\s*[:：]\s*(.+)$", text, re.I):
             title = m.group(1)
-        title = re.sub(r"\s*(?:ให้หน่อย|หน่อย|priority\s*\w+|ด่วน\w*)\s*", " ", title or text, flags=re.I).strip(" ,.")
-        args = {"title": title[:120] or "Ticket จาก AI helper", "priority": _find_priority(t) or "medium"}
+        title = re.sub(r"\s*(?:ให้หน่อย|หน่อย|priority\s*\w+|ด่วน\w*)\s*", " ", title or text, flags=re.I)
+        title = re.sub(r",?\s*(?:via|from)\s+(?:line|email|app|web chat|facebook(?: messenger)?|messenger)\b", "",
+                       title, flags=re.I)
+        title = re.sub(r"\s*,(?:\s*,)+", ",", title).strip(" ,.")
+        args = {"title": title[:120] or L("Ticket จาก AI helper", "Ticket from the AI helper"),
+                "priority": _find_priority(t) or "medium"}
         for word, channel in CHANNELS:
             if word in t:
                 args["channel"] = channel
@@ -199,39 +227,46 @@ class FakeLLM:
         for step in done:
             name, args, data = step["name"], step["arguments"], step.get("data")
             if step.get("declined"):
-                out.append(f"ยกเลิกแล้ว ไม่ได้เรียก `{name}` (admin ไม่อนุมัติ) จึงไม่ได้เปลี่ยนแปลงอะไรต่อ")
+                out.append(L(f"ยกเลิกแล้ว ไม่ได้เรียก `{name}` (admin ไม่อนุมัติ) จึงไม่ได้เปลี่ยนแปลงอะไรต่อ",
+                             f"Cancelled: `{name}` was not called (the admin declined), so nothing else changed."))
             elif not step["ok"]:
-                out.append(f"ทำไม่สำเร็จ: {step['error']}")
+                out.append(L(f"ทำไม่สำเร็จ: {step['error']}", f"That failed: {step['error']}"))
             elif name == "search_tickets":
                 out.append(self._search_text(user_text, args, data))
             elif name == "get_ticket":
                 c = data.get("comments") or []
-                last = f"\nComment ล่าสุด ({c[-1]['author']}): {c[-1]['text']}" if c else "\nยังไม่มี comment"
-                out.append(f"#{data['id']} {data['title']}\nสถานะ {data['status']} · {data['priority']} · "
+                if c:
+                    last = L(f"\nComment ล่าสุด ({c[-1]['author']}): {c[-1]['text']}",
+                             f"\nLatest comment ({c[-1]['author']}): {c[-1]['text']}")
+                else:
+                    last = L("\nยังไม่มี comment", "\nNo comments yet")
+                out.append(f"#{data['id']} {data['title']}\n{L('สถานะ', 'Status')} {data['status']} · {data['priority']} · "
                            f"@{data['assignee'] or 'unassigned'} · {data['channel']} · {_sla_text(data)}{last}")
             elif name == "create_ticket":
-                out.append(f"สร้าง ticket #{data['id']} แล้ว: \"{data['title']}\" ({data['priority']}, {data['channel']}) "
-                           f"· {_sla_text(data)}")
+                out.append(L(f"สร้าง ticket #{data['id']} แล้ว", f"Created ticket #{data['id']}") +
+                           f": \"{data['title']}\" ({data['priority']}, {data['channel']}) · {_sla_text(data)}")
             elif name == "update_ticket":
                 changed = ", ".join(f"{k} → {v}" for k, v in args.items() if k != "ticket_id")
-                out.append(f"อัปเดต #{args['ticket_id']} แล้ว: {changed}")
+                out.append(L(f"อัปเดต #{args['ticket_id']} แล้ว", f"Updated #{args['ticket_id']}") + f": {changed}")
             elif name == "add_comment":
-                out.append(f"เพิ่ม comment ใน #{args['ticket_id']} แล้ว: \"{args['text']}\"")
+                out.append(L(f"เพิ่ม comment ใน #{args['ticket_id']} แล้ว", f"Added a comment to #{args['ticket_id']}") +
+                           f": \"{args['text']}\"")
         return "\n\n".join(out)
 
     @staticmethod
     def _search_text(user_text: str, args: dict, tickets: list[dict]) -> str:
-        if re.search(r"สรุป|จำนวน|กี่", user_text):
+        if re.search(r"สรุป|จำนวน|กี่|how many|count|summar", user_text, re.I):
             counts: dict[str, int] = {}
             for x in tickets:
                 counts[x["status"]] = counts.get(x["status"], 0) + 1
-            return f"ทั้งหมด {len(tickets)} tickets: " + ", ".join(f"{k} {v}" for k, v in counts.items())
+            return (L(f"ทั้งหมด {len(tickets)} tickets: ", f"{len(tickets)} tickets in total: ")
+                    + ", ".join(f"{k} {v}" for k, v in counts.items()))
         if not tickets:
-            return "ไม่เจอ ticket ที่ตรงเงื่อนไขครับ"
+            return L("ไม่เจอ ticket ที่ตรงเงื่อนไขครับ", "No tickets match that.")
         lines = [f"• #{x['id']} [{x['priority']}] {x['title']} — @{x['assignee'] or 'unassigned'} · {_sla_text(x)}"
                  for x in tickets[:8]]
-        more = f"\n…และอีก {len(tickets) - 8} รายการ" if len(tickets) > 8 else ""
-        return f"เจอ {len(tickets)} tickets:\n" + "\n".join(lines) + more
+        more = L(f"\n…และอีก {len(tickets) - 8} รายการ", f"\n…and {len(tickets) - 8} more") if len(tickets) > 8 else ""
+        return L(f"เจอ {len(tickets)} tickets:\n", f"Found {len(tickets)} tickets:\n") + "\n".join(lines) + more
 
 
 # =============================================================================================
@@ -272,7 +307,7 @@ class Agent:
         await ready
         self._mtime = mtime
         if reconnect:
-            return {"kind": "info", "text": f"server.py ถูกแก้ → reconnect MCP แล้วโหลด tools ใหม่ ({len(self.tools)} tools)"}
+            return {"kind": "info", "text": L(f"server.py ถูกแก้ → reconnect MCP แล้วโหลด tools ใหม่ ({len(self.tools)} tools)", f"server.py changed → reconnected to MCP and reloaded tools ({len(self.tools)} tools)")}
         return None
 
     async def _hold_connection(self, ready: asyncio.Future) -> None:
@@ -290,7 +325,7 @@ class Agent:
                     await self._stop.wait()
         except BaseException as exc:  # noqa: BLE001 — report connection failures to the caller
             if not ready.done():
-                ready.set_exception(RuntimeError(f"เชื่อม MCP server ไม่ได้: {exc!r}"))
+                ready.set_exception(RuntimeError(f"Cannot connect to the MCP server: {exc!r}"))
         finally:
             self.session = None
 
@@ -305,28 +340,30 @@ class Agent:
 
     # ---- the loop ----------------------------------------------------------------------------
     async def chat(self, message: str) -> dict:
+        _use_language_of(message)
         events = []
         if note := await self.ensure_connected():
             events.append(note)
         conv = Conversation(id=uuid.uuid4().hex[:8], user_text=message)
         self.conversations[conv.id] = conv
-        events.append({"kind": "info", "text": f"ส่งข้อความ + tools/list ({len(self.tools)} tools) ให้ LLM"})
+        events.append({"kind": "info", "text": L(f"ส่งข้อความ + tools/list ({len(self.tools)} tools) ให้ LLM", f"Sending the message + tools/list ({len(self.tools)} tools) to the LLM")})
         events += await self._advance(conv)
         return self._response(conv, events)
 
     async def confirm(self, conversation_id: str, approve: bool) -> dict:
         conv = self.conversations.get(conversation_id)
         if not conv or not conv.pending:
-            return {"conversation_id": conversation_id, "events": [{"kind": "answer", "text": "ไม่มีรายการรออนุมัติแล้ว"}],
+            return {"conversation_id": conversation_id, "events": [{"kind": "answer", "text": "Nothing is waiting for approval any more."}],
                     "state": "done"}
+        _use_language_of(conv.user_text)
         await self.ensure_connected()
         name, args = conv.pending["name"], conv.pending["arguments"]
         conv.pending = None
         if approve:
-            events = [{"kind": "info", "text": f"admin อนุมัติ → เรียก {name}"}] + await self._execute(conv, name, args)
+            events = [{"kind": "info", "text": L(f"admin อนุมัติ → เรียก {name}", f"Admin approved → calling {name}")}] + await self._execute(conv, name, args)
         else:
             conv.done.append({"name": name, "arguments": args, "ok": False, "declined": True})
-            events = [{"kind": "info", "text": f"admin ไม่อนุมัติ → ไม่เรียก {name}"}]
+            events = [{"kind": "info", "text": L(f"admin ไม่อนุมัติ → ไม่เรียก {name}", f"Admin declined → not calling {name}")}]
         events += await self._advance(conv)
         return self._response(conv, events)
 
@@ -345,15 +382,15 @@ class Agent:
                 events.append({"kind": "confirm", "name": name, "arguments": args})
                 return events
             events += await self._execute(conv, name, args)
-        events.append({"kind": "answer", "text": f"หยุดที่ {MAX_STEPS} steps (กันวนไม่รู้จบ)"})
+        events.append({"kind": "answer", "text": L(f"หยุดที่ {MAX_STEPS} steps (กันวนไม่รู้จบ)", f"Stopped after {MAX_STEPS} steps (loop guard)")})
         return events
 
     async def _execute(self, conv: Conversation, name: str, args: dict) -> list[dict]:
         try:
             result = await self.session.call_tool(name, args)
         except Exception as exc:  # noqa: BLE001 — connection problems become a failed step
-            conv.done.append({"name": name, "arguments": args, "ok": False, "error": f"MCP call ล้มเหลว: {exc!r}"})
-            return [{"kind": "result", "ok": False, "text": f"MCP call ล้มเหลว: {exc!r}"}]
+            conv.done.append({"name": name, "arguments": args, "ok": False, "error": f"MCP call failed: {exc!r}"})
+            return [{"kind": "result", "ok": False, "text": f"MCP call failed: {exc!r}"}]
         wire = result.model_dump(mode="json", by_alias=True, exclude_none=True)
         texts = [c.get("text", "") for c in wire.get("content", []) if c.get("type") == "text"]
         if wire.get("isError"):
@@ -367,7 +404,7 @@ class Agent:
             data = json.loads(texts[0])
         conv.done.append({"name": name, "arguments": args, "ok": True, "data": data})
         summary = f"{len(data)} tickets" if isinstance(data, list) else f"ticket #{data.get('id')}"
-        return [{"kind": "result", "ok": True, "text": f"ได้ผลกลับมา: {summary}"}]
+        return [{"kind": "result", "ok": True, "text": L(f"ได้ผลกลับมา: {summary}", f"Result: {summary}")}]
 
     @staticmethod
     def _response(conv: Conversation, events: list[dict]) -> dict:
