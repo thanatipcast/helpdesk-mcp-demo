@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "helpdesk": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["server.py"],
+      "env": {
+        "HELPDESK_API": "http://127.0.0.1:8765/api",
+        "HELPDESK_USER": "demo-dev",
+        "HELPDESK_CLIENT": "Claude Code (MCP)"
+      }
+    }
+  }
+}
